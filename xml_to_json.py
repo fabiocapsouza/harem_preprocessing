@@ -47,11 +47,14 @@ class XMLtoJSON:
     
     def __init__(self,
                  selective: bool = False,
-                 alt_strategy: str = 'most_entities'):
+                 alt_strategy: str = 'most_entities',
+                 version: str = 'first_and_mini'):
         if selective:
             self._accepted_labels = SELECTIVE_CATEGS
         else:
             self._accepted_labels = ALL_CATEGS
+
+        self.version = version
         
         strategies = ('most_entities', 'entity_coverage')
         if alt_strategy not in strategies:
@@ -89,7 +92,7 @@ class XMLtoJSON:
     def _convert_entity(self, elem: etree._Element) -> ENTITY:
         """Convert an <EM/> tag into a dict with the relevant information
         considering the label scenario."""
-        entity_text = elem.text.lstrip()
+        entity_text = " ".join(elem.text.strip().split())
         if entity_text != elem.text:
             logger.debug(
                 'Left stripping spaces of <EM ID="%s">%s</EM>',
@@ -251,7 +254,7 @@ class XMLtoJSON:
         """Conditionally inserts one space at the end of `text` to avoid word
         agglutination that would happen by concatenating `text` and `insertion`.
         """
-        if not text:
+        if not text or not insertion:
             return text
         
         if not _is_whitespace_or_punctuation(text[-1]) \
@@ -293,31 +296,29 @@ class XMLtoJSON:
 
         elif tag.tag == 'ALT':
             alt_text, alt_entities = self._handle_alt(tag)
-            text = alt_text
+            text = " ".join(alt_text.strip().split())
             entities = alt_entities
         
-        if tag.tail is not None:
-            text = self._avoid_word_agglutination(text, tag.tail)
-            text += tag.tail
+        if tag.tail is not None and tag.tail.strip() != '':
+            tag_tail = " ".join(tag.tail.strip().split())
+            text = self._avoid_word_agglutination(text, tag_tail)
+            text += tag_tail
                 
         return text, entities
 
-
-    def convert_document(self, doc: etree._Element) -> DOCUMENT:
+    def _convert_sentence(self, p: etree._Element, p_idx: int) -> DOCUMENT:
         """Convert DOC tag to a dictionary with all the relevant info."""
         
         text = ''
         entities = []
         
-        if doc.tag != 'DOC':
-            raise ValueError("`convert_document` expects a DOC tag.")
-        
-        if doc.text is not None:
+        if p.text is not None:
             # Initial text before any tag
-            text += doc.text
+            text += " ".join(p.text.split())
         
-        for tag in doc:
+        for tag in p:
             tag_text, tag_entities = self._convert_tag(tag)
+            
             text = self._avoid_word_agglutination(text, tag_text)
 
             # Entity start and end offsets are relative to begin of `tag`.
@@ -333,10 +334,58 @@ class XMLtoJSON:
             entities.extend(tag_entities)
                 
         return {
-            'doc_id': doc.attrib['DOCID'],
-            'doc_text': ''.join(text),
+            'p_id': p_idx,
+            'p_text': ''.join(text),
             'entities': entities,
         }
+
+    def convert_document(self, doc: etree._Element, ) -> DOCUMENT:
+        """Convert DOC tag to a dictionary with all the relevant info."""
+        
+        text = ''
+        entities = []
+        
+        if doc.tag != 'DOC':
+            raise ValueError("`convert_document` expects a DOC tag.")
+        
+        if (self.version == 'second'):
+            ps = []
+            p_idx = 0
+            for p in doc.findall('P'):
+                p_info = self._convert_sentence(p, p_idx)
+                ps.append(p_info)
+                p_idx += 1
+            
+            return {
+                'doc_id': doc.attrib['DOCID'],
+                'doc_ps': ps
+            }
+        else:
+            if doc.text is not None:
+                # Initial text before any tag
+                text += " ".join(doc.text.split())
+            
+            for tag in doc:
+                tag_text, tag_entities = self._convert_tag(tag)
+                text = self._avoid_word_agglutination(text, tag_text)
+
+                # Entity start and end offsets are relative to begin of `tag`.
+                # Shift tag_entities by current doc text length.
+                for entity in tag_entities:
+                    self._shift_offset(entity, len(text))
+
+                # If last character was not a whitespace or punctuation, add space
+                # to prevent that an entity contains a word only partially
+                if tag_text:
+                    text = self.append_text_safe(text, tag_text)
+                
+                entities.extend(tag_entities)
+                    
+            return {
+                'doc_id': doc.attrib['DOCID'],
+                'doc_text': ''.join(text),
+                'entities': entities,
+            }
 
     @classmethod
     def convert_xml(cls, xml: str, **kwargs) -> List[DOCUMENT]:
@@ -353,6 +402,28 @@ class XMLtoJSON:
         return docs
 
 
+def save_file(saving_strategy: str, output_path: str, converted_data: List[DOCUMENT], overwrite: any):
+    """Saves the converted data according to the saving strategy."""
+
+    
+    if saving_strategy == "one_file":
+        print(f'Writing output file to {output_path}')
+        with open(output_path, 'w', encoding='UTF-8') as fd:
+            json.dump(converted_data, fd,ensure_ascii=False)
+    else:
+
+        for doc in converted_data:
+            output_dir, _ = os.path.split(output_path)
+            output_file = f"HAREMdoc_{doc['doc_id']}.json"
+            output_dir = os.path.join(output_dir, output_file)
+            
+            if os.path.isfile(output_dir) and not overwrite:
+                raise OSError(f'Output file {output_dir} already exists. Delete it or run with --overwrite flag.')
+
+            print(f'Writing output file to {output_dir}')    
+            with open(output_dir, 'w', encoding='UTF-8') as fd:
+                json.dump(doc['doc_ps'],fd, ensure_ascii=False)
+
 if __name__ == "__main__":
     from argparse import ArgumentParser
     import json
@@ -367,6 +438,14 @@ if __name__ == "__main__":
                         required=True,
                         choices=['selective', 'total'],
                         help="Scenario for entity label consideration.")
+    parser.add_argument('--version',
+                        choices=['first_and_mini', 'second'],
+                        default='first_and_mini',
+                        help="HAREM dataset Version for processing strategy.")
+    parser.add_argument('--saving_strategy',
+                        choices=['one_file', 'doc_files'],
+                        default='one_file',
+                        help="Output saving strategy.")
     parser.add_argument('--alt_strategy',
                         choices=['most_entities', 'entity_coverage'],
                         default='most_entities',
@@ -375,6 +454,7 @@ if __name__ == "__main__":
                         help='Overwrite output file.')
     parser.add_argument('--verbose', action='store_true',
                         help='Turn on verbose mode.')
+    
     args = parser.parse_args()
 
     if not args.input_file.endswith('.xml'):
@@ -385,7 +465,7 @@ if __name__ == "__main__":
     output_file = f'{input_fname}-{args.scenario}.json'
     output_path = os.path.join(input_dir, output_file)
 
-    if os.path.isfile(output_path) and not args.overwrite:
+    if os.path.isfile(output_path) and not args.overwrite and args.saving_strategy == 'one_file':
         raise OSError(f'Output file {output_path} already exists. Delete it '
                        'or run with --overwrite flag.')
     logging.basicConfig()
@@ -396,8 +476,8 @@ if __name__ == "__main__":
     converted_data = XMLtoJSON.convert_xml(
         args.input_file,
         selective=args.scenario == 'selective',
-        alt_strategy=args.alt_strategy)
+        alt_strategy=args.alt_strategy,
+        version=args.version)
 
-    print(f'Writing output file to {output_path}')
-    with open(output_path, 'w') as fd:
-        json.dump(converted_data, fd)
+    save_file(args.saving_strategy, output_path, converted_data, args.overwrite)
+    
